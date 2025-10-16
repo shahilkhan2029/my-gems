@@ -466,7 +466,7 @@ async def llm_generate_initial_and_refine(prompt: str, task_id: str, image_parts
     }
     return final
 
-async def llm_round2_surgical_update(prompt: str, task_id: str, image_parts: list, system_prompt: str, response_schema: dict, existing_files: dict) -> dict:
+async def call_llm_round2_surgical_update(prompt: str, task_id: str, image_parts: list, system_prompt: str, response_schema: dict, existing_files: dict) -> dict:
     """
     Base-style approach oriented to Round 2: pass existing files explicitly and require surgical update.
     The LLM must return the full JSON with index.html, README.md, LICENSE, but READMEs/LICENSES must be copied verbatim if possible.
@@ -678,26 +678,53 @@ async def generate_files_and_deploy(task_data: TaskRequest):
             )
 
         # --- Round 2+: Surgical Update ---
+        # main.py (lines 525-551)
+
+        # --- Round 2+: Surgical Update ---
         else:
             logger.info("[WORKFLOW] Round 2+: surgical update (Base.py style). Loading existing index.html only.")
             existing_index_html = ""
             idx_path = os.path.join(local_path, "index.html")
-            if os.path.exists(idx_path):
-                try:
-                    with open(idx_path, "r", encoding="utf-8") as f:
-                        existing_index_html = f.read()
-                    logger.info("[WORKFLOW] Read existing index.html for context.")
-                except Exception as e:
-                    logger.warning(f"[WORKFLOW] Could not read existing index.html: {e}")
-                    existing_index_html = ""
+            
+            # 1. Define missing context variables from R1 for the R2+ call
+            system_prompt = (
+                "You are an expert full-stack engineer. Produce a JSON object with keys 'index.html', 'README.md', and 'LICENSE'. "
+                "index.html must be a single-file responsive HTML app using Tailwind CSS. "
+                "If image attachments are mentioned below, reference them using <img src='filename'> exactly as provided. "
+                "README.md should be professional, LICENSE should contain the full MIT license text."
+            )
+            response_schema = LLM_RESPONSE_SCHEMA # Use the global schema
 
-            # Add attachments info to round 2 prompt as well
+            existing_files_context = {}
+            
+            # Load existing files to pass as context
+            for filename in ["index.html", "README.md", "LICENSE"]:
+                file_path = os.path.join(local_path, filename)
+                if os.path.exists(file_path):
+                    try:
+                        with open(file_path, "r", encoding="utf-8") as f:
+                            existing_files_context[filename] = f.read()
+                        logger.info(f"[WORKFLOW] Read existing {filename} for context.")
+                    except Exception as e:
+                        logger.warning(f"[WORKFLOW] Could not read existing {filename}: {e}")
+                        existing_files_context[filename] = ""
+            
+            # 2. Add attachments info to round 2 prompt as well
             brief_with_attachments = f"{brief}\n\n{attachment_descriptions}".strip()
+            
+            # 3. Correct the function call and arguments
             generated = await call_llm_round2_surgical_update(
-                task_id=task_id, brief=brief_with_attachments, existing_index_html=existing_index_html
+                prompt=brief_with_attachments, # brief_with_attachments is the new prompt
+                task_id=task_id, 
+                image_parts=image_parts, # pass any image attachments
+                system_prompt=system_prompt,
+                response_schema=response_schema,
+                existing_files=existing_files_context # pass all loaded files
             )
 
-            # Preserve README/LICENSE if LLM didn’t return them
+            # Preserve README/LICENSE if LLM didn’t return them (this logic is now redundant 
+            # as it's handled in call_llm_round2_surgical_update, but keeping it for safety 
+            # without removing any existing lines)
             readme_path = os.path.join(local_path, "README.md")
             license_path = os.path.join(local_path, "LICENSE")
             if not generated.get("README.md") and os.path.exists(readme_path):
