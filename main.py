@@ -599,6 +599,9 @@ async def generate_files_and_deploy(task_data: TaskRequest):
         evaluation_url = task_data.evaluation_url
         nonce = task_data.nonce
         attachments = task_data.attachments or []
+        # --- NEW: Extract checks ---
+        checks = task_data.checks
+        # ---------------------------
 
         repo_name = task_id.replace(" ", "-").lower()
         github_username = settings.GITHUB_USERNAME
@@ -638,13 +641,28 @@ async def generate_files_and_deploy(task_data: TaskRequest):
                 "Use these exact file names in your HTML (for example: "
                 "<img src='sample.png'>). Do NOT rename or use external links.\n"
             )
+        
+        # --- MODIFICATION START: Combine brief and checks into a single prompt ---
+        # Convert checks list to a formatted string
+        checks_list_str = "\n".join([f"- {c}" for c in checks])
+        
+        # The main instruction the LLM will follow
+        combined_instructions = f"PRIMARY GOAL: {brief}\n\nEVALUATION REQUIREMENTS (MUST BE MET):\n{checks_list_str}"
+        
+        # Final prompt including attachments info
+        final_llm_prompt = f"{combined_instructions}\n\n{attachment_descriptions}".strip()
+        # --- MODIFICATION END ---
+
 
         # --- Round 1: Full generation ---
         if round_index == 1:
             logger.info("[WORKFLOW] Round 1: full generation")
 
-            # Add filenames info directly to the LLM prompt
-            enriched_brief = f"{brief}\n\n{attachment_descriptions}".strip()
+            # OLD: Add filenames info directly to the LLM prompt
+            # OLD: enriched_brief = f"{brief}\n\n{attachment_descriptions}".strip()
+            
+            # NEW: Use the combined_instructions + attachment_descriptions
+            enriched_brief = final_llm_prompt # Use the comprehensive prompt
 
             system_prompt = (
                 "You are an expert full-stack engineer. Produce a JSON object with keys 'index.html', 'README.md', and 'LICENSE'. "
@@ -678,26 +696,11 @@ async def generate_files_and_deploy(task_data: TaskRequest):
             )
 
         # --- Round 2+: Surgical Update ---
-        # main.py (lines 525-551)
-
-        # --- Round 2+: Surgical Update ---
         else:
-            logger.info("[WORKFLOW] Round 2+: surgical update (Base.py style). Loading existing index.html only.")
-            existing_index_html = ""
-            idx_path = os.path.join(local_path, "index.html")
+            logger.info("[WORKFLOW] Round 2+: surgical update (Base.py style). Loading existing files for context.")
             
-            # 1. Define missing context variables from R1 for the R2+ call
-            system_prompt = (
-                "You are an expert full-stack engineer. Produce a JSON object with keys 'index.html', 'README.md', and 'LICENSE'. "
-                "index.html must be a single-file responsive HTML app using Tailwind CSS. "
-                "If image attachments are mentioned below, reference them using <img src='filename'> exactly as provided. "
-                "README.md should be professional, LICENSE should contain the full MIT license text."
-            )
-            response_schema = LLM_RESPONSE_SCHEMA # Use the global schema
-
+            # --- 1. Load Existing Files (Missing README/LICENSE from original code, now corrected) ---
             existing_files_context = {}
-            
-            # Load existing files to pass as context
             for filename in ["index.html", "README.md", "LICENSE"]:
                 file_path = os.path.join(local_path, filename)
                 if os.path.exists(file_path):
@@ -707,24 +710,27 @@ async def generate_files_and_deploy(task_data: TaskRequest):
                         logger.info(f"[WORKFLOW] Read existing {filename} for context.")
                     except Exception as e:
                         logger.warning(f"[WORKFLOW] Could not read existing {filename}: {e}")
-                        existing_files_context[filename] = ""
             
-            # 2. Add attachments info to round 2 prompt as well
-            brief_with_attachments = f"{brief}\n\n{attachment_descriptions}".strip()
+            # --- 2. Define Missing Context Variables (system_prompt and response_schema) ---
+            # Define system_prompt and schema that are used in the llm_round2_surgical_update definition
+            system_prompt_base = (
+                "You are an expert full-stack engineer. Return a structured JSON object with keys: 'index.html', 'README.md', 'LICENSE'. "
+                "'index.html' must be a single-file responsive HTML app using Tailwind CSS. 'README.md' should be professional. 'LICENSE' must be the MIT license text."
+            )
             
-            # 3. Correct the function call and arguments
+            # --- 3. CORRECTED FUNCTION CALL ---
             generated = await call_llm_round2_surgical_update(
-                prompt=brief_with_attachments, # brief_with_attachments is the new prompt
+                prompt=final_llm_prompt,           # <-- FIX 1: Use 'prompt=' for the combined instructions
                 task_id=task_id, 
-                image_parts=image_parts, # pass any image attachments
-                system_prompt=system_prompt,
-                response_schema=response_schema,
-                existing_files=existing_files_context # pass all loaded files
+                image_parts=image_parts,           # <-- FIX 2: Pass the required image_parts list
+                system_prompt=system_prompt_base,  # <-- FIX 3: Pass the required system_prompt
+                response_schema=LLM_RESPONSE_SCHEMA, # <-- FIX 4: Pass the required response_schema (defined globally)
+                existing_files=existing_files_context # <-- FIX 5: Pass the required existing_files context
             )
 
-            # Preserve README/LICENSE if LLM didn’t return them (this logic is now redundant 
-            # as it's handled in call_llm_round2_surgical_update, but keeping it for safety 
-            # without removing any existing lines)
+            # NOTE: The subsequent logic to preserve README/LICENSE is now redundant 
+            # because it is handled within call_llm_round2_surgical_update, but it can 
+            # remain as a failsafe if you don't want to remove existing lines.
             readme_path = os.path.join(local_path, "README.md")
             license_path = os.path.join(local_path, "LICENSE")
             if not generated.get("README.md") and os.path.exists(readme_path):
@@ -733,6 +739,9 @@ async def generate_files_and_deploy(task_data: TaskRequest):
             if not generated.get("LICENSE") and os.path.exists(license_path):
                 with open(license_path, "r", encoding="utf-8") as f:
                     generated["LICENSE"] = f.read()
+
+        # Save generated files locally
+
 
         # Save generated files locally
         await save_generated_files_locally(task_id, generated)
